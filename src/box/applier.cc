@@ -458,6 +458,11 @@ applier_wait_snapshot(struct applier *applier)
 				xrow_decode_vclock_xc(&row, &replicaset.vclock);
 			}
 			break; /* end of stream */
+		} else if (iproto_type_is_promote_request(row.type)) {
+			struct synchro_request req;
+			if (xrow_decode_synchro(&row, &req) != 0)
+				diag_raise();
+			txn_limbo_process(&txn_limbo, &req);
 		} else if (iproto_type_is_error(row.type)) {
 			xrow_decode_error_xc(&row);  /* rethrow error */
 		} else {

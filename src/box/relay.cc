@@ -399,11 +399,26 @@ relay_initial_join(int fd, uint64_t sync, struct vclock *vclock)
 	if (txn_limbo_wait_confirm(&txn_limbo) != 0)
 		diag_raise();
 
+	struct synchro_request req;
+	txn_limbo_checkpoint(&txn_limbo, &req);
+
 	/* Respond to the JOIN request with the current vclock. */
 	struct xrow_header row;
 	xrow_encode_vclock_xc(&row, vclock);
 	row.sync = sync;
 	coio_write_xrow(&relay->io, &row);
+
+	/*
+	 * Send out the latest limbo state. Don't do that when limbo is unused,
+	 * let the old instances join without trouble.
+	 */
+	if (req.replica_id != REPLICA_ID_NIL) {
+		char body[XROW_SYNCHRO_BODY_LEN_MAX];
+		xrow_encode_synchro(&row, body, &req);
+		row.replica_id = req.replica_id;
+		row.sync = sync;
+		coio_write_xrow(&relay->io, &row);
+	}
 
 	/* Send read view to the replica. */
 	engine_join_xc(&ctx, &relay->stream);
