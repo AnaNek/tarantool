@@ -1527,13 +1527,14 @@ box_wait_quorum(uint32_t lead_id, int64_t target_lsn, int quorum,
 	return 0;
 }
 
-int
-box_promote(void)
+static int
+box_clear_synchro_queue(bool demote)
 {
 	/* A guard to block multiple simultaneous function invocations. */
 	static bool in_promote = false;
 	if (in_promote) {
-		diag_set(ClientError, ER_UNSUPPORTED, "box.ctl.promote",
+		diag_set(ClientError, ER_UNSUPPORTED,
+			 demote ? "box.ctl.demote" : "box.ctl.promote",
 			 "simultaneous invocations");
 		return -1;
 	}
@@ -1691,10 +1692,16 @@ promote:
 				raft_new_term(box_raft());
 
 			uint64_t term = box_raft()->volatile_term;
-			txn_limbo_write_promote(&txn_limbo, wait_lsn,
-						term);
+			if (demote) {
+				txn_limbo_write_demote(&txn_limbo, wait_lsn,
+						       term);
+			} else {
+				txn_limbo_write_promote(&txn_limbo, wait_lsn,
+							term);
+			}
+			uint16_t type = demote ? IPROTO_DEMOTE : IPROTO_PROMOTE;
 			struct synchro_request req = {
-				.type = IPROTO_PROMOTE,
+				.type = type,
 				.replica_id = former_leader_id,
 				.origin_id = instance_id,
 				.lsn = wait_lsn,
@@ -1705,6 +1712,18 @@ promote:
 		}
 	}
 	return rc;
+}
+
+int
+box_promote(void)
+{
+	return box_clear_synchro_queue(false);
+}
+
+int
+box_demote(void)
+{
+	return box_clear_synchro_queue(true);
 }
 
 int
