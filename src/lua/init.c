@@ -69,6 +69,10 @@
 #include <readline/readline.h>
 #include <readline/history.h>
 
+/* Don't include the entire header only for *_init(). */
+int
+tarantool_lua_serializer_init(struct lua_State *L);
+
 /**
  * The single Lua state of the transaction processor (tx) thread.
  */
@@ -475,6 +479,7 @@ tarantool_lua_init(const char *tarantool_bin, int argc, char **argv)
 	tarantool_lua_socket_init(L);
 	tarantool_lua_pickle_init(L);
 	tarantool_lua_digest_init(L);
+	tarantool_lua_serializer_init(L);
 	tarantool_lua_swim_init(L);
 	tarantool_lua_decimal_init(L);
 	luaopen_http_client_driver(L);
