@@ -36,6 +36,7 @@
 #include <msgpuck.h>
 #include <small/ibuf.h>
 #include <small/obuf.h>
+#include <on_shutdown.h>
 #include "third_party/base64.h"
 
 #include "version.h"
@@ -139,6 +140,10 @@ struct iproto_thread {
 	 * List of stopped connections
 	 */
 	RLIST_HEAD(stopped_connections);
+	/*
+	 * List of all alive connections.
+	 */
+	struct rlist alive_connections;
 	/*
 	 * Iproto thread stat
 	 */
@@ -504,6 +509,10 @@ struct iproto_connection
 	 */
 	enum iproto_connection_state state;
 	struct rlist in_stop_list;
+	/**
+	 * Member of list with all connections in iproto_thread.
+	 */
+	struct rlist in_all_list;
 	/**
 	 * Kharon is used to implement box.session.push().
 	 * When a new push is ready, tx uses kharon to notify
@@ -1178,6 +1187,7 @@ iproto_connection_delete(struct iproto_connection *con)
 	       con->obuf[0].iov[0].iov_base == NULL);
 	assert(con->obuf[1].pos == 0 &&
 	       con->obuf[1].iov[0].iov_base == NULL);
+	rlist_del_entry(con, in_all_list);
 	mempool_free(&con->iproto_thread->iproto_connection_pool, con);
 }
 
@@ -2022,6 +2032,7 @@ iproto_on_accept(struct evio_service *service, int fd,
 	msg->p_ibuf = con->p_ibuf;
 	msg->wpos = con->wpos;
 	cpipe_push(&iproto_thread->tx_pipe, &msg->base);
+	rlist_add_entry(&iproto_thread->alive_connections, con, in_all_list);
 	return 0;
 }
 
@@ -2161,6 +2172,76 @@ iproto_session_push(struct session *session, struct port *port)
 
 /** }}} */
 
+/**
+ * Read all data from connection socket and shutdown(con, SHUT_RD) all connections
+ * in iproto_thread.
+ */
+static inline void
+iproto_process_shutdown(struct iproto_thread* iproto_thread)
+{
+	while (!rlist_empty(&iproto_thread->alive_connections)){
+		struct iproto_connection *con =
+			rlist_first_entry(&iproto_thread->alive_connections,
+					  struct iproto_connection,
+					  in_all_list);
+		rlist_del(&con->in_all_list);
+		int fd = con->input.fd;
+		if (fd < 0)
+			continue;
+		try {
+			iproto_resume(con->iproto_thread);
+			/* Read input while input exists and msg_max_limit isn't reached. */
+			while (rlist_empty(&con->in_stop_list)) {
+				if (iproto_check_msg_max(con->iproto_thread))
+					break;
+				/* Ensure we have sufficient space for the read.  */
+				struct ibuf *in = iproto_connection_input_buffer(con);
+				if (in == NULL)
+					break;
+				/* Read input. */
+				int nrd = sio_read(fd, in->wpos, ibuf_unused(in));
+				if (nrd < 0 && !sio_wouldblock(errno))
+					diag_raise();
+				if (nrd <= 0)
+					break;
+				/* Count statistics */
+				rmean_collect(con->iproto_thread->rmean,
+					      IPROTO_RECEIVED, nrd);
+
+				/* Update the read position and connection state. */
+				in->wpos += nrd;
+				con->parse_size += nrd;
+				/* Enqueue all requests which are fully read up. */
+				if (iproto_enqueue_batch(con, in) != 0)
+					diag_raise();
+			}
+		} catch (Exception *e) {
+			iproto_write_error(fd, e, ::schema_version, 0);
+			e->log();
+		}
+		/*
+		 * Discard unparsed data, to recycle the
+		 * connection in net_send_msg() as soon as all
+		 * parsed data is processed.  It's important this
+		 * is done only once.
+		 */
+		con->p_ibuf->wpos -= con->parse_size;
+		con->parse_size = 0;
+		shutdown(con->input.fd, SHUT_RD);
+	}
+}
+
+void
+iproto_send_shutdown_msg(void);
+
+static int
+graceful_shutdown_trigger(void *arg)
+{
+	(void) arg;
+	iproto_send_shutdown_msg();
+	return 0;
+}
+
 static inline void
 iproto_thread_init_routes(struct iproto_thread *iproto_thread)
 {
@@ -2260,7 +2341,8 @@ iproto_init(int threads_count)
 		/* .sync = */ iproto_session_sync,
 	};
 
-
+	if (box_on_shutdown(NULL, graceful_shutdown_trigger, NULL) != 0)
+		panic("failed to register iproto shutdown function");
 	iproto_threads = (struct iproto_thread *)
 		calloc(threads_count, sizeof(struct iproto_thread));
 	if (iproto_threads == NULL) {
@@ -2282,6 +2364,9 @@ iproto_init(int threads_count)
 			goto fail;
 		}
 		/* Create a pipe to "net" thread. */
+		iproto_thread->alive_connections =
+			RLIST_HEAD_INITIALIZER(iproto_thread->
+				alive_connections);
 		iproto_thread->stopped_connections =
 			RLIST_HEAD_INITIALIZER(iproto_thread->
 					       stopped_connections);
@@ -2321,6 +2406,11 @@ enum iproto_cfg_op {
 	 * Command code do get statistic from iproto thread
 	 */
 	IPROTO_CFG_STAT,
+	/**
+	* Command code to process shutdown in all connections from
+	* iproto thread
+	*/
+	IPROTO_CFG_SHUTDOWN,
 };
 
 /**
@@ -2414,6 +2504,9 @@ iproto_do_cfg_f(struct cbus_call_msg *m)
 		case IPROTO_CFG_STAT:
 			iproto_fill_stat(iproto_thread, cfg_msg);
 			break;
+		case IPROTO_CFG_SHUTDOWN:
+			iproto_process_shutdown(iproto_thread);
+			break;
 		default:
 			unreachable();
 		}
@@ -2438,6 +2531,15 @@ iproto_send_stop_msg(void)
 {
 	struct iproto_cfg_msg cfg_msg;
 	iproto_cfg_msg_create(&cfg_msg, IPROTO_CFG_STOP);
+	for (int i = 0; i < iproto_threads_count; i++)
+		iproto_do_cfg(&iproto_threads[i], &cfg_msg);
+}
+
+void
+iproto_send_shutdown_msg(void)
+{
+	struct iproto_cfg_msg cfg_msg;
+	iproto_cfg_msg_create(&cfg_msg, IPROTO_CFG_SHUTDOWN);
 	for (int i = 0; i < iproto_threads_count; i++)
 		iproto_do_cfg(&iproto_threads[i], &cfg_msg);
 }
