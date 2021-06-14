@@ -1270,6 +1270,7 @@ iproto_msg_decode(struct iproto_msg *msg, const char **pos, const char *reqend,
 			goto error;
 		cmsg_init(&msg->base, iproto_thread->sql_route);
 		break;
+	case IPROTO_SHUTDOWN:
 	case IPROTO_PING:
 		cmsg_init(&msg->base, iproto_thread->misc_route);
 		break;
@@ -1673,6 +1674,7 @@ tx_process_misc(struct cmsg *m)
 {
 	struct iproto_msg *msg = tx_accept_msg(m);
 	struct iproto_connection *con = msg->connection;
+	struct session *session = con->session;
 	struct obuf *out = con->tx.p_obuf;
 	if (tx_check_schema(msg->header.schema_version))
 		goto error;
@@ -1682,6 +1684,14 @@ tx_process_misc(struct cmsg *m)
 		switch (msg->header.type) {
 		case IPROTO_AUTH:
 			box_process_auth(&msg->auth, con->salt);
+			iproto_reply_ok_xc(out, msg->header.sync,
+					   ::schema_version);
+			break;
+		case IPROTO_SHUTDOWN:
+			session->client_shutdown_got = true;
+			session->graceful_shutdown = true;
+			if (is_shutdown_ready(session))
+				fiber_cond_broadcast(&session->shutdown_cond);
 			iproto_reply_ok_xc(out, msg->header.sync,
 					   ::schema_version);
 			break;
@@ -1871,7 +1881,11 @@ net_send_msg(struct cmsg *m)
 			ev_feed_event(con->loop, &con->output, EV_WRITE);
 	} else if (iproto_connection_is_idle(con)) {
 		iproto_connection_close(con);
+		goto msg_delete;
 	}
+	if (msg->header.type == IPROTO_SHUTDOWN)
+		shutdown(msg->connection->input.fd, SHUT_RD);
+msg_delete:
 	iproto_msg_delete(msg);
 }
 
