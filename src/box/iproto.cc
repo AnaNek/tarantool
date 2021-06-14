@@ -1306,6 +1306,7 @@ iproto_msg_decode(struct iproto_msg *msg, const char **pos, const char *reqend,
 			goto error;
 		cmsg_init(&msg->base, iproto_thread->sql_route);
 		break;
+	case IPROTO_SHUTDOWN:
 	case IPROTO_PING:
 		cmsg_init(&msg->base, iproto_thread->misc_route);
 		break;
@@ -1721,6 +1722,11 @@ tx_process_misc(struct cmsg *m)
 			iproto_reply_ok_xc(out, msg->header.sync,
 					   ::schema_version);
 			break;
+		case IPROTO_SHUTDOWN:
+			con->session->graceful_shutdown = true;
+			iproto_reply_ok_xc(out, msg->header.sync,
+					   ::schema_version);
+			break;
 		case IPROTO_PING:
 			iproto_reply_ok_xc(out, msg->header.sync,
 					   ::schema_version);
@@ -1886,6 +1892,9 @@ tx_process_replication(struct cmsg *m)
 	}
 }
 
+static inline bool
+iproto_is_connection_shutdown_ready(struct iproto_connection *con);
+
 static void
 net_send_msg(struct cmsg *m)
 {
@@ -1907,6 +1916,12 @@ net_send_msg(struct cmsg *m)
 			ev_feed_event(con->loop, &con->output, EV_WRITE);
 	} else if (iproto_connection_is_idle(con)) {
 		iproto_connection_close(con);
+	}
+	if (msg->header.type == IPROTO_SHUTDOWN) {
+		con->graceful_shutdown_got = true;
+		if (iproto_is_connection_shutdown_ready(con))
+			fiber_cond_broadcast(&con->shutdown_cond);
+		shutdown(con->input.fd, SHUT_RD);
 	}
 	iproto_msg_delete(msg);
 }
