@@ -135,6 +135,10 @@ struct iproto_thread {
 	 */
 	struct mempool iproto_msg_pool;
 	struct mempool iproto_connection_pool;
+	/**
+	 * fiber_cond to wait for iproto_msg_pool emptiness.
+	 */
+	struct fiber_cond active_requests_cond;
 	/*
 	 * List of stopped connections
 	 */
@@ -562,6 +566,29 @@ struct iproto_connection
 };
 
 /**
+ * Wait while number of active requests > 0 in @a iproto_thread.
+ */
+static inline void
+iproto_wait_no_active_requests(struct iproto_thread *iproto_thread)
+{
+	if (mempool_count(&iproto_thread->iproto_msg_pool) > 0)
+		fiber_cond_wait(&iproto_thread->active_requests_cond);
+}
+
+/**
+ * mempool_free(&iproto_thread->iproto_msg_pool, msg) wrapper for detecting the
+ * moment when the last message in @a iproto_thread was freed during shutdown
+ * process.
+ */
+static inline void
+iproto_msg_free(struct iproto_thread *iproto_thread, struct iproto_msg *msg) {
+	mempool_free(&iproto_thread->iproto_msg_pool, msg);
+	if (iproto_thread->is_shutdown_active &&
+	    mempool_count(&iproto_thread->iproto_msg_pool) == 0)
+		fiber_cond_broadcast(&iproto_thread->active_requests_cond);
+}
+
+/**
  * Return true if we have not enough spare messages
  * in the message pool.
  */
@@ -576,7 +603,7 @@ static inline void
 iproto_msg_delete(struct iproto_msg *msg)
 {
 	struct iproto_thread *iproto_thread = msg->connection->iproto_thread;
-	mempool_free(&msg->connection->iproto_thread->iproto_msg_pool, msg);
+	iproto_msg_free(msg->connection->iproto_thread, msg);
 	iproto_resume(iproto_thread);
 }
 
@@ -587,7 +614,7 @@ iproto_msg_new(struct iproto_connection *con)
 	struct iproto_msg *msg =
 		(struct iproto_msg *) mempool_alloc(iproto_msg_pool);
 	ERROR_INJECT(ERRINJ_TESTING, {
-		mempool_free(&con->iproto_thread->iproto_msg_pool, msg);
+		iproto_msg_free(con->iproto_thread, msg);
 		msg = NULL;
 	});
 	if (msg == NULL) {
@@ -2263,6 +2290,7 @@ iproto_thread_init(struct iproto_thread *iproto_thread)
 		return -1;
 	}
 	iproto_thread->is_shutdown_active = false;
+	fiber_cond_create(&iproto_thread->active_requests_cond);
 
 	return 0;
 }
