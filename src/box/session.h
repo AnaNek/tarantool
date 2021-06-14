@@ -107,6 +107,12 @@ struct session {
 	uint64_t id;
 	/** Support of graceful shutdown. */
 	bool graceful_shutdown;
+	/** Got shutdown packet from client. */
+	bool client_shutdown_got;
+	/** Net socket isn't exist or happened shutdown(socket, SHUT_RD). */
+	bool socket_shutdown;
+	/** fiber_cond to wait for shutdown readiness. */
+	struct fiber_cond shutdown_cond;
 	/** SQL Tarantool Default storage engine. */
 	uint8_t sql_default_engine;
 	/** SQL Connection flag for current user session */
@@ -186,6 +192,22 @@ extern struct rlist session_on_auth;
 
 /** Global list with all active sessions. */
 extern struct rlist active_sessions;
+
+/**
+  * True if both conditions are true:
+  * 1) Client doesn't support graceful shutdown and happened
+  * shutdown(socket, SHUT_RD) on net-socket (if socket exists).
+  * 2) Client support graceful shutdown and got
+  * IPROTO_SHUTDOWN from client.
+  */
+bool
+is_shutdown_ready(struct session *session);
+
+/**
+  * Wait for @a session shutdown readiness.
+  */
+void
+wait_shutdown_ready(struct session *session);
 
 /**
  * Get the current session from @a fiber

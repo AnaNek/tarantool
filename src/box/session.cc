@@ -139,6 +139,10 @@ session_create(enum session_type type)
 
 	session->id = sid_max();
 	session->graceful_shutdown = false;
+	session->client_shutdown_got = false;
+	/* Socket isn't exist now. Set to false with creation of socket. */
+	session->socket_shutdown = true;
+	fiber_cond_create(&session->shutdown_cond);
 	memset(&session->meta, 0, sizeof(session->meta));
 	session_set_type(session, type);
 	session->sql_flags = default_flags;
@@ -181,6 +185,19 @@ session_create_on_demand(void)
 	fiber_set_session(fiber(), s);
 	fiber_set_user(fiber(), &s->credentials);
 	return s;
+}
+
+bool
+is_shutdown_ready(struct session *session) {
+	return (session->graceful_shutdown && session->client_shutdown_got) ||
+	       (!session->graceful_shutdown && session->socket_shutdown);
+}
+
+void
+wait_shutdown_ready(struct session *session)
+{
+	if(! is_shutdown_ready(session))
+		fiber_cond_wait(&session->shutdown_cond);
 }
 
 bool
@@ -266,6 +283,7 @@ session_destroy(struct session *session)
 	credentials_destroy(&session->credentials);
 	sql_session_stmt_hash_erase(session->sql_stmts);
 	rlist_del_entry(session, in_active_list);
+	fiber_cond_broadcast(&session->shutdown_cond);
 	mempool_free(&session_pool, session);
 }
 

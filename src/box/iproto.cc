@@ -1935,6 +1935,7 @@ tx_process_connect(struct cmsg *m)
 		con->session = session_create(SESSION_TYPE_BINARY);
 		if (con->session == NULL)
 			diag_raise();
+		con->session->socket_shutdown = false;
 		con->session->meta.connection = con;
 		tx_fiber_init(con->session, 0);
 		char *greeting = (char *) static_alloc(IPROTO_GREETING_SIZE);
