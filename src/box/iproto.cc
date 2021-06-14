@@ -142,6 +142,10 @@ struct iproto_thread {
 	 * fiber_cond to wait for iproto_msg_pool emptiness.
 	 */
 	struct fiber_cond active_requests_cond;
+	/**
+	 * fiber_cond to wait for iproto_connection_pool emptiness.
+	 */
+	struct fiber_cond alive_connections_cond;
 	/*
 	 * List of stopped connections
 	 */
@@ -607,6 +611,31 @@ iproto_wait_no_active_requests(struct iproto_thread *iproto_thread)
 {
 	if (mempool_count(&iproto_thread->iproto_msg_pool) > 0)
 		fiber_cond_wait(&iproto_thread->active_requests_cond);
+}
+
+/**
+ * Wait while number of alive connections > 0 in @a iproto_thread.
+ */
+static inline void
+iproto_wait_no_alive_connections(struct iproto_thread *iproto_thread)
+{
+	if (mempool_count(&iproto_thread->iproto_connection_pool) > 0)
+		fiber_cond_wait(&iproto_thread->alive_connections_cond);
+}
+
+/**
+ * mempool_free(&iproto_thread->iproto_connection_pool, con) wrapper for
+ * detecting the  moment when the last connection in @a iproto_thread was
+ * freed during shutdown process.
+ */
+static inline void
+iproto_connection_free(struct iproto_thread *iproto_thread,
+		       struct iproto_connection *con)
+{
+	mempool_free(&con->iproto_thread->iproto_connection_pool, con);
+	if (iproto_thread->is_shutdown_active &&
+	    mempool_count(&iproto_thread->iproto_connection_pool) == 0)
+		fiber_cond_broadcast(&iproto_thread->alive_connections_cond);
 }
 
 /**
@@ -1245,7 +1274,7 @@ iproto_connection_delete(struct iproto_connection *con)
 	       con->obuf[0].iov[0].iov_base == NULL);
 	assert(con->obuf[1].pos == 0 &&
 	       con->obuf[1].iov[0].iov_base == NULL);
-	mempool_free(&con->iproto_thread->iproto_connection_pool, con);
+	iproto_connection_free(con->iproto_thread, con);
 }
 
 /* }}} iproto_connection */
@@ -2097,7 +2126,7 @@ iproto_on_accept(struct evio_service *service, int fd,
 	 */
 	msg = iproto_msg_new(con);
 	if (msg == NULL) {
-		mempool_free(&con->iproto_thread->iproto_connection_pool, con);
+		iproto_connection_free(con->iproto_thread, con);
 		return -1;
 	}
 	cmsg_init(&msg->base, iproto_thread->connect_route);
@@ -2444,6 +2473,7 @@ iproto_thread_init(struct iproto_thread *iproto_thread)
 	}
 	iproto_thread->is_shutdown_active = false;
 	fiber_cond_create(&iproto_thread->active_requests_cond);
+	fiber_cond_create(&iproto_thread->alive_connections_cond);
 
 	return 0;
 }
