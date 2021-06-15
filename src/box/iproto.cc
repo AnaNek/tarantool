@@ -119,6 +119,9 @@ struct iproto_thread {
 	 */
 	struct cmsg_hop destroy_route[2];
 	struct cmsg_hop disconnect_route[2];
+	struct cmsg_hop shutdown_route[1];
+	struct cmsg_hop graceful_shutdown_route[1];
+	struct cmsg_hop not_graceful_shutdown_route[2];
 	struct cmsg_hop misc_route[2];
 	struct cmsg_hop call_route[2];
 	struct cmsg_hop select_route[2];
@@ -509,6 +512,26 @@ struct iproto_connection
 	 * connection.
 	 */
 	struct cmsg destroy_msg;
+	/**
+	 * Pre-allocated msg. Is sent after shutdown has started. If session
+	 * support graceful shutdown, then pushes graceful_shutdown_msg to its
+	 * route, else pushes not_graceful_shutdown_msg to its route.
+	 */
+	struct cmsg shutdown_msg;
+	/**
+	 * Pre-allocated msg. Is sent after shutdown has started only if
+	 * session support graceful shutdown. Sends IPROTO_SHUTDOWN to remote
+	 * client.
+	 */
+	struct cmsg graceful_shutdown_msg;
+	/**
+	 * Pre-allocated msg. Is sent after shutdown has started only if
+	 * session doesn't support graceful shutdown(or isn't exist). Reads
+	 * data from socket until iproto boundary or until msg_max_limit is
+	 * reached and shutdown(con, SHUT_RD). Then, notify session (if session
+	 * exists) about shutdown of socket.
+	 */
+	struct cmsg not_graceful_shutdown_msg;
 	/**
 	 * Connection state. Mainly it is used to determine when
 	 * the connection can be destroyed, and for debug purposes
@@ -2234,6 +2257,96 @@ iproto_session_push(struct session *session, struct port *port)
 
 /** }}} */
 
+static void
+tx_start_shutdown(struct cmsg *m)
+{
+	struct iproto_connection *con =
+		container_of(m, struct iproto_connection, shutdown_msg);
+	struct cpipe *net_pipe = &con->iproto_thread->net_pipe;
+	if (con->session && con->session->graceful_shutdown)
+		cpipe_push(net_pipe, &con->graceful_shutdown_msg);
+	else
+		cpipe_push(net_pipe, &con->not_graceful_shutdown_msg);
+}
+
+/**
+ * Send IPROTO_SHUTDOWN to a remote client.
+ */
+static void
+net_send_shutdown(struct cmsg *m)
+{
+	struct iproto_connection *con =
+		container_of(m, struct iproto_connection, shutdown_msg);
+	iproto_reply_shutdown(con->tx.p_obuf, ::schema_version);
+	if (!con->tx.is_push_sent)
+		tx_begin_push(con);
+	else
+		con->tx.is_push_pending = true;
+}
+
+/**
+ * Read input socket of connection until iproto packet boundary or until
+ * msg_max_limit is reached and shutdown(con, SHUT_RD).
+ */
+static void
+net_shutdown_socket(struct cmsg *m)
+{
+	struct iproto_connection *con =
+		container_of(m, struct iproto_connection, shutdown_msg);
+	int fd = con->input.fd;
+	if (fd < 0)
+		return;
+	try {
+		iproto_resume(con->iproto_thread);
+		/* Read input while input exists and msg_max_limit isn't
+		 * reached.
+		 */
+		while (rlist_empty(&con->in_stop_list)) {
+			if (iproto_check_msg_max(con->iproto_thread))
+				break;
+			/* Ensure we have sufficient space for the read.  */
+			struct ibuf *in = iproto_connection_input_buffer(con);
+			if (in == NULL)
+				break;
+			/* Read input. */
+			int nrd = sio_read(fd, in->wpos, ibuf_unused(in));
+			if (nrd < 0 && !sio_wouldblock(errno))
+				diag_raise();
+			if (nrd <= 0)
+				break;
+			/* Count statistics */
+			rmean_collect(con->iproto_thread->rmean,
+				      IPROTO_RECEIVED, nrd);
+
+			/* Update the read position and connection state. */
+			in->wpos += nrd;
+			con->parse_size += nrd;
+			/* Enqueue all requests which are fully read up. */
+			if (iproto_enqueue_batch(con, in) != 0)
+				diag_raise();
+		}
+	} catch (Exception *e) {
+		iproto_write_error(fd, e, ::schema_version, 0);
+		e->log();
+	}
+	shutdown(fd, SHUT_RD);
+}
+
+/**
+ * Notify session about end of read from socket.
+ */
+static void
+tx_set_socket_shutdown(struct cmsg *m)
+{
+	struct iproto_connection *con =
+		container_of(m, struct iproto_connection, shutdown_msg);
+	if (con->session != NULL) {
+		con->session->socket_shutdown = true;
+		if (is_shutdown_ready(con->session))
+			fiber_cond_broadcast(&con->session->shutdown_cond);
+	}
+}
+
 static inline void
 iproto_thread_init_routes(struct iproto_thread *iproto_thread)
 {
@@ -2245,6 +2358,8 @@ iproto_thread_init_routes(struct iproto_thread *iproto_thread)
 		{ tx_process_disconnect, &iproto_thread->net_pipe };
 	iproto_thread->disconnect_route[1] =
 		{ net_finish_disconnect, NULL };
+	iproto_thread->shutdown_route[0] =
+		{ tx_start_shutdown, NULL };
 	iproto_thread->misc_route[0] =
 		{ tx_process_misc, &iproto_thread->net_pipe };
 	iproto_thread->misc_route[1] = { net_send_msg, NULL };
