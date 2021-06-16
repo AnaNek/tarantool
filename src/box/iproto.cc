@@ -501,6 +501,17 @@ struct iproto_connection
 	 * connection.
 	 */
 	struct cmsg destroy_msg;
+	/** fiber_cond to wait for shutdown readiness. */
+	struct fiber_cond shutdown_cond;
+	/** Happened shutdown(socket, SHUT_RD) on input socket. */
+	bool socket_shutdown;
+	/**
+	* Connection support graceful shutdown. Is set only after start of
+	* shutdown process.
+	*/
+	bool graceful_shutdown;
+	/** Got shutdown packet from client. */
+	bool graceful_shutdown_got;
 	/**
 	 * Connection state. Mainly it is used to determine when
 	 * the connection can be destroyed, and for debug purposes
@@ -2162,6 +2173,35 @@ iproto_session_push(struct session *session, struct port *port)
 }
 
 /** }}} */
+
+/**
+ * True if both conditions are true:
+ * 1) Client doesn't support graceful shutdown and happened
+ * shutdown(socket, SHUT_RD) on net-socket (if socket exists).
+ * 2) Client support graceful shutdown and got
+ * IPROTO_SHUTDOWN from client.
+ *
+ * UB if shutdown process is not started because graceful_shutdown field is
+ * not initialized.
+ */
+static inline bool
+iproto_is_connection_shutdown_ready(struct iproto_connection *con)
+{
+	assert(con->iproto_thread->is_shutdown_active);
+	return (con->graceful_shutdown && con->graceful_shutdown_got) ||
+	       (!con->graceful_shutdown && con->socket_shutdown);
+}
+
+/**
+ * Wait until connection becomes ready for shutdown. UB if shutdown process
+ * is not started.
+ */
+static inline void
+iproto_wait_connection_shutdown_ready(struct iproto_connection *con)
+{
+	if (!iproto_is_connection_shutdown_ready(con))
+		fiber_cond_wait(&con->shutdown_cond);
+}
 
 static inline void
 iproto_thread_init_routes(struct iproto_thread *iproto_thread)
