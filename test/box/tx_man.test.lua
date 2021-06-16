@@ -613,6 +613,15 @@ tx2('s:replace{1, 2}')
 tx2:commit()
 tx1:commit()
 
+-- https://github.com/tarantool/tarantool/issues/6140
+s3 = box.schema.space.create('test3')
+i31 = s3:create_index('pk', {parts={{1, 'uint'}}})
+tx1:begin()
+tx1('s3:replace{2}')
+tx1('s3:select{}')
+s3:drop()
+tx1:rollback()
+
 s:drop()
 
 test_run:cmd("switch default")
