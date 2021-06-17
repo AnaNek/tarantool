@@ -596,6 +596,7 @@ memtx_tx_story_gc_step()
 		return;
 	}
 	if (story->add_psn >= lowest_rv_psm ||
+	    story->del_psn == 0 ||
 	    story->del_psn >= lowest_rv_psm) {
 		/* The story can be used by a read view. */
 		return;
