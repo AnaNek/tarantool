@@ -8,32 +8,35 @@ test_run = require('test_run').new()
 box.schema.user.grant('guest', 'replication')
 test_run:cmd('create server replica with rpl_master=default, script="replication/replica.lua"')
 test_run:cmd('start server replica')
-box.info.replication[2].downstream.status
-
+test_run:wait_downstream(2, {status = 'follow'})
 
 -- make applier incapable of reading rows in one go, so that it
 -- yields a couple of times.
 test_run:cmd('switch replica')
 box.error.injection.set("ERRINJ_SIO_READ_MAX", 1)
+replication_timeout = box.cfg.replication_timeout
+box.cfg{replication_timeout = replication_timeout * 5}
 test_run:cmd('switch default')
+replication_timeout = box.cfg.replication_timeout
+box.cfg{replication_timeout = replication_timeout * 5}
 s = box.schema.space.create('test')
 _ = s:create_index('pk')
 for i = 1,5 do box.space.test:replace{1, digest.urandom(1024)} collectgarbage('collect') end
 -- replication_disconnect_timeout is 4 * replication_timeout, check that
 -- replica doesn't time out too early.
 test_run:cmd('setopt delimiter ";"')
-ok = true;
+status = nil;
 start = fiber.time();
 while fiber.time() - start < 3 * box.cfg.replication_timeout do
-    if box.info.replication[2].downstream.status ~= 'follow' then
-        ok = false
+    status = box.info.replication[2].downstream.status
+    if status ~= 'follow' then
         break
     end
     fiber.sleep(0.001)
 end;
 test_run:cmd('setopt delimiter ""');
 
-ok
+status
 
 s:drop()
 test_run:cmd('stop server replica')
