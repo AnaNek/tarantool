@@ -463,6 +463,11 @@ applier_wait_snapshot(struct applier *applier)
 			if (xrow_decode_synchro(&row, &req) != 0)
 				diag_raise();
 			txn_limbo_process(&txn_limbo, &req);
+		} else if (iproto_type_is_raft_request(row.type)) {
+			struct raft_request req;
+			if (xrow_decode_raft(&row, &req, NULL) != 0)
+				diag_raise();
+			box_raft_recover(&req);
 		} else if (iproto_type_is_error(row.type)) {
 			xrow_decode_error_xc(&row);  /* rethrow error */
 		} else {
