@@ -596,7 +596,6 @@ memtx_tx_story_gc_step()
 		return;
 	}
 	if (story->add_psn >= lowest_rv_psm ||
-	    story->del_psn == 0 ||
 	    story->del_psn >= lowest_rv_psm) {
 		/* The story can be used by a read view. */
 		return;
@@ -607,6 +606,10 @@ memtx_tx_story_gc_step()
 			return;
 		}
 	}
+
+	const char *str = tuple_str(story->tuple);
+	if (strstr(str, "vasya") != NULL)
+		printf("DELETE story %s\n", str);
 
 	/* Unlink and delete the story */
 	memtx_tx_story_full_unlink(story);
@@ -1322,6 +1325,11 @@ memtx_tx_history_prepare_stmt(struct txn_stmt *stmt)
 {
 	assert(stmt->txn->psn != 0);
 
+	/**
+	 * History of a key in an index can consist of several stories.
+	 * The list of stories is started with a dirty tuple that in index.
+	 * The list begins with several (mna
+	 */
 	/* Move story to the past to prepared stories. */
 
 	struct memtx_story *story = stmt->add_story;
@@ -1434,6 +1442,7 @@ memtx_tx_history_prepare_stmt(struct txn_stmt *stmt)
 				}
 				oldest_story->del_stmt = stmt;
 				stmt->del_story = oldest_story;
+				stmt->next_in_del_list = NULL;
 			}
 		}
 	}
