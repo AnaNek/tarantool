@@ -681,6 +681,120 @@ box_check_uri(const char *source, const char *option_name)
 	return 0;
 }
 
+static int
+box_check_delimiters(const char *source, const char *delimiters,
+		     const char *error)
+{
+	for (unsigned i = 0; delimiters[i] != '\0'; i++) {
+		if (source[0] == delimiters[i]) {
+			diag_set(ClientError, ER_CFG, "listen", error);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static int
+box_check_uri_option(const char *opt, const char *val)
+{
+	if (!strcmp(opt, "transport")) {
+		if (strcmp(val, "plain")) {
+			diag_set(ClientError, ER_CFG, "listen",
+				 tt_sprintf("invalid value `%s` for "
+				 	    "transport option", val));
+			return -1;
+		}
+	} else {
+		diag_set(ClientError, ER_CFG, "listen",
+			 tt_sprintf("invalid option `%s` for uri", opt));
+		return -1;
+	}
+	return 0;
+}
+
+static int
+box_check_uri_options(char *opts)
+{
+	char *saveptr1, *saveptr2, *saveptr3;
+	for (char *optval = opts; opts != NULL; optval = NULL) {
+		char *optval_token = strtok_r(optval, "&", &saveptr1);
+		if (optval_token == NULL)
+                	break;
+                char *opt = strtok_r(optval_token, "=", &saveptr2);
+                char *vals = strtok_r(NULL, "=", &saveptr2);
+                if (opt == NULL) {
+                	diag_set(ClientError, ER_CFG, "listen",
+                		 "invalid value `null` for uri option");
+                	return -1;
+                }
+                if (vals == NULL) {
+                	diag_set(ClientError, ER_CFG, "listen",
+                		 tt_sprintf("invalid value `null` for uri "
+                		 	    "`%s` option", opt));
+                	return -1;
+                }
+                for (char *val = vals; vals != NULL; val = NULL) {
+                	char *val_token = strtok_r(val, ";", &saveptr3);
+                	if (val_token == NULL)
+                		break;
+                	if (box_check_uri_option(opt, val_token) != 0)
+                		return -1;
+                }
+	}
+	return 0;
+}
+
+static int
+box_check_uri_with_options(const char *source)
+{
+	int rc = 0;
+	char *uri_with_opts, *uri_with_opts_token;
+	char *saveptr1, *saveptr2;
+	const char *error = "expected host:service or /unix.socket";
+
+	char *source_copy = strdup(source);
+	if (source_copy == NULL) {
+		diag_set(OutOfMemory, strlen(source) + 1,
+			 "strdup", "source");
+		return -1;
+	}
+
+	if (box_check_delimiters(source_copy, ", ", error) != 0)
+			return -1;
+
+	for (uri_with_opts = source_copy; ; uri_with_opts = NULL) {
+		uri_with_opts_token =
+			strtok_r(uri_with_opts, ", ", &saveptr1);
+		if (uri_with_opts_token == NULL)
+			break;
+		if (box_check_delimiters(uri_with_opts_token, "?", error) != 0)
+			return -1;
+		char *uri = strtok_r(uri_with_opts_token, "?", &saveptr2);
+		char *opts = strtok_r(NULL, "?", &saveptr2);
+		if ((rc = box_check_uri(uri, "listen")) != 0)
+			goto cleanup;
+		if ((rc = box_check_uri_options(opts)) != 0)
+			goto cleanup;
+	}
+
+cleanup:
+	if (source_copy != NULL)
+		free(source_copy);
+	return rc;
+}
+
+static int
+box_check_listen(void)
+{
+	int count = cfg_getarr_size("listen");
+	for (int i = 0; i < count; i++) {
+		const char *source = cfg_getarr_elem("listen", i);
+		if (box_check_uri_with_options(source) != 0)
+			return -1;
+	}
+	return 0;
+}
+
 static enum election_mode
 box_check_election_mode(void)
 {
@@ -1136,7 +1250,7 @@ box_check_config(void)
 {
 	struct tt_uuid uuid;
 	box_check_say();
-	if (box_check_uri(cfg_gets("listen"), "listen") != 0)
+	if (box_check_listen() != 0)
 		diag_raise();
 	box_check_instance_uuid(&uuid);
 	box_check_replicaset_uuid(&uuid);
@@ -1707,16 +1821,63 @@ promote:
 int
 box_listen(void)
 {
-	const char *uri_array[1];
-	const char *uri = cfg_gets("listen");
-	if (box_check_uri(uri, "listen") != 0)
+	if (box_check_listen() != 0)
 		return -1;
-	if (uri == NULL)
+
+	int count = cfg_getarr_size("listen");
+	if (count == 0)
 		return iproto_stop_listen();
-	uri_array[0] = uri;
-	if (iproto_listen(uri_array, 1) != 0)
-		return -1;
-	return 0;
+
+	int uri_with_opts, rc = 0;
+	char *uri_array[IPROTO_LISTEN_SOCKET_MAX];
+	char *uri_with_opts_array[IPROTO_LISTEN_SOCKET_MAX];
+	uint32_t uri_array_size = 0;
+	assert(count <= IPROTO_LISTEN_SOCKET_MAX);
+
+	for (uri_with_opts = 0; uri_with_opts < count; uri_with_opts++) {
+		const char *source = cfg_getarr_elem("listen", uri_with_opts);
+		char *source_copy = strdup(source);
+		if (source_copy == NULL) {
+			diag_set(OutOfMemory, strlen(source) + 1,
+				 "strdup", "source");
+			rc = -1;
+			goto cleanup;
+		}
+		uri_with_opts_array[uri_with_opts] = source_copy;
+		char *uri = strtok(source_copy, ", ");
+		while (uri != NULL) {
+			uri_array[uri_array_size++] = uri;
+			uri = strtok(NULL, ", ");
+		}
+		assert(uri_array_size <= IPROTO_LISTEN_SOCKET_MAX);
+	}
+
+	/*
+	 * At the moment, we ignore every listen options,
+	 * later this behaviour can be changed.
+	 */
+	for (unsigned i = 0; i < uri_array_size; i++)
+		uri_array[i] = strtok(uri_array[i], "?");
+
+	/*
+	 * Check that there is no same listen adresses in array.
+	 */
+	for (unsigned i = 0; i < uri_array_size; i++) {
+		for (unsigned j = i + 1; j < uri_array_size; j++) {
+			if (!strcmp(uri_array[i], uri_array[j])) {
+				diag_set(ClientError, ER_CFG, "listen",
+					 "unable to set multiple same uris");
+				rc = -1;
+				goto cleanup;
+			}
+		}
+	}
+
+	rc = iproto_listen((const char **)uri_array, uri_array_size);
+cleanup:
+	for (int i = 0; i < uri_with_opts; i++)
+		free(uri_with_opts_array[i]);
+	return rc;
 }
 
 void

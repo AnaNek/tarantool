@@ -142,7 +142,7 @@ local module_cfg_type = {
 -- forget to update it when add a new type or a combination of
 -- types here.
 local template_cfg = {
-    listen              = 'string, number',
+    listen              = 'string, number, table',
     memtx_memory        = 'number',
     strip_core          = 'boolean',
     memtx_min_tuple_size  = 'number',
@@ -234,9 +234,87 @@ local function normalize_uri_list(port_list)
     return result
 end
 
+local function str_split (inputstr, sep)
+    local t = {}
+    for str in string.gmatch(inputstr, "([^"..sep.."]+)") do
+        t[#t + 1] = str:gsub("^%s*(.-)%s*$", "%1")
+    end
+    return t
+end
+
+local function normalize_uri_option(port, name)
+    local value = ""
+    assert(type(port) == 'table')
+    for i = 1, #port do
+        value = value .. name .. "=" .. port[i]
+        if i ~= #port then
+            value = value .. "&"
+        end
+    end
+    return value
+end
+
+local function normalize_uri_with_options(port)
+    if not port["uri"] then
+        box.error(box.error.CFG, 'listen', 'missing uri')
+    end
+    local value = port["uri"] .. "?"
+    for key, val in pairs(port) do
+        if type(key) ~= 'string' then
+            box.error(box.error.CFG, 'listen', 'passing uri in table format ' ..
+                      'requires a string key for each value')
+        end
+        if key ~= 'uri' then
+            if type(val) ~= 'table' then
+                val = str_split(val, ",")
+            end
+            value = value .. normalize_uri_option(val, key) .. "&"
+        end
+    end
+    return value:sub(1, -2);
+end
+
+local function normalize_uris_with_options(port_list, result)
+    for key, val in pairs(port_list) do
+        if type(val) == 'table' then
+            normalize_uris_with_options(val, result)
+        elseif type(key) == 'string' then
+            table.insert(result, normalize_uri_with_options(port_list))
+            break
+        elseif type(key) == 'number' then
+            table.insert(result, normalize_uri(val))
+        else
+            box.error(box.error.CFG, 'listen', 'invalid input format')
+        end
+    end
+end
+
+local function normalize_uris_with_options_port_list(port_list)
+    local result = {}
+    if type(port_list) == 'table' then
+        for key, port in pairs(port_list) do
+            if type(port) == 'table' then
+                result[key] = normalize_uris_with_options_port_list(port)
+            else
+                result[key] = normalize_uri(port)
+            end
+        end
+    else
+        table.insert(result, normalize_uri(port_list))
+    end
+    return result
+end
+
+local function normalize_uris_with_options_passed_in_multiple_ways(port_list)
+    local result = {}
+    port_list = normalize_uris_with_options_port_list(port_list)
+    normalize_uris_with_options(port_list, result)
+    return #result > 1 and result or (result[1] ~= "" and result[1] or nil)
+end
+
 -- options that require special handling
 local modify_cfg = {
-    listen             = normalize_uri,
+    listen             = normalize_uris_with_options_passed_in_multiple_ways,
     replication        = normalize_uri_list,
 }
 
